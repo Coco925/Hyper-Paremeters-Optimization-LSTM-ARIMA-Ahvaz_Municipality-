@@ -1,0 +1,246 @@
+#1
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.callbacks import EarlyStopping
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials, space_eval
+import mysql.connector
+import dotenv
+from dotenv import dotenv_values
+import os
+import pandas as pd 
+
+
+#reding the table from server-----------------------------------------------------------------------------------------------------------------
+#test git
+filename = os.path.basename(__file__)
+path = str(__file__).replace(filename, '')
+env = dotenv_values(path + '.env')
+# env = dotenv_values(r'C:\Users\satia\Desktop\137\zobale'+'.env')
+query = "SELECT * "
+query += " FROM `request_statistics`"
+query += " "
+
+try:
+    connection = mysql.connector.connect(host=env['DB_HOST'], database=env['DB_DATABASE'], user=env['DB_USERNAME'],
+                                         password=env['DB_PASSWORD'])
+
+#    connection = mysql.connector.connect(host="192.168.168.125", database="requestdb", user="requestuser",
+                                         #password="SxfWL7myDid1JBqS")
+except mysql.connector.Error as err:
+    print('There was an error connecting to the database!!!')
+    print(err)
+    exit()
+cursor = connection.cursor(dictionary=True)
+cursor.execute(query)
+last = cursor.fetchall()
+last = pd.DataFrame(last)
+# print (dfm)
+if connection.is_connected():
+    cursor.close()
+    connection.close()
+    
+#removing unnecessary columns of the table--------------------------------------------------------------------------------------------------------   
+
+last = last.drop('statisticsType', axis=1)
+last = last.drop('subjectID', axis=1)
+last = last.drop('id', axis=1)
+last = last.drop('created_at', axis=1)
+last = last.drop('updated_at', axis=1)
+last.drop(last.tail(1).index,inplace=True)
+#_______________________________________________________________________________________________________
+last = last.drop('time', axis=1)
+print (last)
+
+data=last.copy()
+# Function to handle outliers/anomalies
+def iqr_fence(x):
+    Q1 = x.quantile(0.25)
+    Q3 = x.quantile(0.75)
+    IQR = Q3 - Q1
+    Lower_Fence = Q1 - (1.5 * IQR)
+    Upper_Fence = Q3 + (1.5* IQR)
+    u = max(x[x<Upper_Fence])
+    l = min(x[x>Lower_Fence])
+    return [u,l]
+
+
+def handle_outliers(data):
+
+    for column in data.columns:
+        threshold=iqr_fence(data[column])[0]
+        data[column] = data[column].mask(data[column] > threshold, int(threshold))
+    return data
+
+# Handle outliers/anomalies in the dataset
+data = handle_outliers(data)
+print(data)
+
+# Preprocess the data
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(data.values)
+
+# Split the data into train and test sets
+train_size = int(len(scaled_data) * 0.8)
+train_data = scaled_data[:train_size]
+test_data = scaled_data[train_size:]
+
+# Store the scaling parameters for inverse scaling of predictions
+scaler_params = {'min': scaler.data_min_[0], 'max': scaler.data_max_[0]}
+
+# Define the look-back values to try
+look_backs = [1, 2, 3, 4, 5, 6, 7, 8]
+
+# Create the training data set
+def create_dataset(data, look_back):
+    X, y = [], []
+    for i in range(look_back, len(data)):
+        X.append(data[i - look_back:i, :])
+        y.append(data[i, :])
+    return np.array(X), np.array(y)
+
+# Define the function to create the LSTM model
+def create_model(params):
+    model = Sequential()
+    model.add(LSTM(units=params['lstm_units'], return_sequences=True, input_shape=(params['look_back'], 1)))  # Update input_shape
+    model.add(LSTM(units=params['lstm_units']))
+    model.add(Dense(units=1))  # Update units
+
+    model.compile(optimizer=params['optimizer'], loss=params['loss_function'])
+    return model
+
+# Define the objective function for Hyperopt
+def objective(params):
+    model = create_model(params)
+
+    X_train, y_train = create_dataset(train_data, params['look_back'])
+
+    early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+    model.fit(X_train, y_train, epochs=params['epochs'], batch_size=params['batch_size'], callbacks=[early_stopping], verbose=0)
+
+    X_test, y_test = create_dataset(test_data, params['look_back'])
+    predictions = model.predict(X_test)
+    predictions = predictions * (scaler_params['max'] - scaler_params['min']) + scaler_params['min']
+
+    mse = mean_squared_error(y_test, predictions)
+    return {'loss': mse, 'status': STATUS_OK}
+
+# Define the search space for Hyperopt
+space = {
+    'lstm_units': hp.choice('lstm_units', [50, 500]),
+    'look_back': hp.choice('look_back', look_backs),
+    'batch_size': hp.choice('batch_size', [1, 10]),
+    'epochs': hp.choice('epochs', [1, 400]),
+    'optimizer': hp.choice('optimizer', ['adam', 'sgd', 'rmsprop', 'adagrad', 'adamax']),
+    'loss_function': hp.choice('loss_function', ['mean_squared_error', 'binary_crossentropy', 'mean_absolute_error', 'huber_loss'])
+}
+
+# Create a list to store the best hyperparameters for each region
+best_hyperparameters = []
+
+# Define the function to create the LSTM model
+def create_model(params):
+    model = Sequential()
+    model.add(LSTM(units=params['lstm_units'], return_sequences=True, input_shape=(params['look_back'], 1)))  # Update input_shape
+    model.add(LSTM(units=params['lstm_units']))
+    model.add(Dense(units=1))  
+
+    model.compile(optimizer=params['optimizer'], loss=params['loss_function'])
+    return model
+
+MAE_Percentage_Error=[]
+Prediction_Metrice=[]
+best_look_backs = []
+# Iterate over each region
+for i, region in enumerate(data.columns):
+    print("Optimizing hyperparameters for region:", region)
+
+    # Extract the data for the current region
+    region_data = data[[region]].values
+
+    # Preprocess the data
+    # scaler = MinMaxScaler(feature_range=(0, 1))
+    # scaled_data = scaler.fit_transform(region_data)
+    scaled_data = region_data
+
+    # Split the data into train and test sets
+    train_size = int(len(scaled_data) * 0.8)
+    train_data = scaled_data[:train_size]
+    test_data = scaled_data[train_size:]
+
+    # Run Hyperopt optimization
+    trials = Trials()
+    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=40, trials=trials)
+
+    # Get the best hyperparameters for the current region
+    best_params = space_eval(space, best)
+    best_hyperparameters.append(best_params)
+
+    # Store the best look_back value for the current region
+    print(best_params['look_back'])
+    best_look_back = best_params['look_back']
+    best_look_backs.append(best_look_back)  
+
+    # Train the model with the best hyperparameters for the current region
+    model = create_model(best_params)
+    X_train, y_train = create_dataset(train_data, best_params['look_back'])
+    early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+    model.fit(X_train, y_train, epochs=best_params['epochs'], batch_size=best_params['batch_size'], callbacks=[early_stopping], verbose=0)
+
+    # Evaluate the model on the test data
+    X_test, y_test = create_dataset(test_data, best_params['look_back'])
+    predictions = model.predict(X_test)
+    predictions = predictions * (scaler_params['max'] - scaler_params['min']) + scaler_params['min']
+    print(np.shape(X_test))
+
+    previous=data[[region]][-best_look_back:]
+    print("previous", previous)
+    values1 = previous.values.reshape(-1,1)
+    values1 = values1.astype('float32')
+    scaler1 = MinMaxScaler(feature_range=(0, 1))
+    scaled1 = scaler.fit_transform(values1)
+    # scaled1
+    previous=np.array(scaled1)
+    previous = scaled1. reshape(1, best_look_back, 1)
+
+
+#using the compiled model to make prediction of next month value using last four months values as inputs------------------------------------------------------
+  
+    Real_prediction = model.predict(previous)
+    Real_prediction = Real_prediction * (scaler_params['max'] - scaler_params['min']) + scaler_params['min'] 
+    print("Real_prediction", Real_prediction)   
+    Prediction_Metrice.append(int(Real_prediction))
+
+    # Calculate evaluation metrics
+    mse = mean_squared_error(y_test, predictions)
+    mae = mean_absolute_error(y_test, predictions)
+    r2 = r2_score(y_test, predictions)
+
+    # Print the evaluation metrics
+    print("Evaluation metrics for region", region)
+    print("MSE:", mse)
+    print("MAE:", mae)
+    print("R2 Score:", r2)
+    print()
+
+    MAE_Percentage_Error.append(mae*100/np.mean(data[region][-4:]))
+    # Store the predicted versus actual values in a DataFrame
+    predicted_table = pd.DataFrame({'Actual': y_test.flatten(), 'Predicted': predictions.flatten()})
+    print("Predicted versus actual values for region", region)
+    print(predicted_table)
+    print()
+
+# Print the best hyperparameters for each region
+print("Best hyperparameters for each region:")
+for i, region in enumerate(data.columns):
+    print("Region:", region)
+    print(best_hyperparameters[i])
+    print("Best look_back:", best_look_backs[i])
+    print()
+
+print("Prediction_Metrice:", Prediction_Metrice)
+print("MAE_Percentage_Error:", MAE_Percentage_Error)
+
